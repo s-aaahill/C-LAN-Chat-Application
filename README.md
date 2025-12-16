@@ -1,106 +1,78 @@
-Thanks for sharing your repository link. I've reviewed your project and appreciate the work you've done on the C++ LAN Chat Application. Here's an enhanced `README.md` tailored to your project:
+# Dockerized TCP Chat Server
 
----
+A robust, real-time chat application written in C++ using TCP sockets. This project supports multiple clients, tracks usernames, logs events, and is designed to be easily deployed via Docker.
 
-# 🗨️ C++ LAN Chat Application
+## Architecture
+The application follows a classic **Client-Server** model:
+- **Server**: Listens on a specified TCP port (default 8080). It manages connected clients, handles username registration, and broadcasts messages to all other connected users. It uses `std::map` to track sessions and a mutex for thread-safe operations.
+- **Client**: Connects to the server IP and port. It runs two threads: one for sending user input and another for receiving messages. Usernames are sent as the initial handshake message.
 
-A real-time chat application developed in C++ using TCP/IP sockets, enabling seamless communication between multiple clients over a Local Area Network (LAN). This project showcases fundamental networking concepts, including socket programming, multithreading, and client-server architecture.
+## Features
+- **Custom Usernames**: Clients identify themselves upon connection.
+- **Environment Configuration**: Server port configurable via `PORT` environment variable.
+- **Server Logging**: Connection, disconnection, and message events are logged to stdout with timestamps.
+- **Docker Ready**: Includes Dockerfile for containerized deployment.
+- **Cross-Platform Code**: Source compatible with Linux and Windows (using Winsock).
 
----
-
-## 🚀 Features
-
-- **Real-Time Communication**: Facilitates instant messaging between clients on the same LAN.
-- **Multithreaded Server**: Handles multiple client connections concurrently using threading.
-- **Simple Terminal Interface**: Operates entirely within the command-line interface.
-- **Cross-Platform Compatibility**: Designed to work on both Windows and Linux systems.
-
----
-
-## 📁 Project Structure
-
-```
-C-LAN-Chat-Application/
-├── client.cpp    # Client-side implementation
-├── server.cpp    # Server-side implementation
-├── README.md     # Project documentation
-```
-
----
-
-## ⚙️ Getting Started
+## Building and Running Locally
 
 ### Prerequisites
+- GCC/G++ Compiler
+- Make
 
-- **C++ Compiler**:
-  - *Windows*: [MinGW](https://osdn.net/projects/mingw/releases/)
-  - *Linux*: GCC
-- **Terminal or Command Prompt**
-
-### Compilation Instructions
-
-#### On Linux:
-
+### Build
+To build both server and client:
 ```bash
-# Compile server
-g++ server.cpp -o server -pthread
-
-# Compile client
-g++ client.cpp -o client
+make
 ```
 
-#### On Windows (using MinGW):
-
+### Run Server
 ```bash
-# Compile server
-g++ server.cpp -o server.exe -lws2_32
-
-# Compile client
-g++ client.cpp -o client.exe -lws2_32
+./server
+# Or specify a custom port (non-Docker way, if modified to take args, but defaults to env/8080)
+# To use env var locally on Linux:
+PORT=9000 ./server
 ```
 
-### Running the Application
+### Run Client
+```bash
+./client 127.0.0.1 8080
+```
 
-1. **Start the Server**:
+## Docker Instructions
 
-   ```bash
-   ./server   # Linux
-   server.exe # Windows
-   ```
+### 1. Build the Docker Image
+Build the container image using the provided Dockerfile.
+```bash
+docker build -t cpp-chat-server .
+```
 
-2. **Start the Client(s)**:
+### 2. Run the Server Container
+Run the server, mapping the port and optionally setting the `PORT` environment variable.
 
-   ```bash
-   ./client <server_ip_address>   # Linux
-   client.exe <server_ip_address> # Windows
-   ```
+**Default (Port 8080):**
+```bash
+docker run -d -p 8080:8080 --name chat-server cpp-chat-server
+```
 
-   Replace `<server_ip_address>` with the IP address of the machine running the server.
+**Custom Port (e.g., 5000):**
+Notice we map host 5000 to container 5000 and tell the app to listen on 5000.
+```bash
+docker run -d -p 5000:5000 -e PORT=5000 --name chat-server cpp-chat-server
+```
 
----
+### 3. Connect Clients
+Clients connect to the server's IP address and exposed port.
+```bash
+# Assuming server is on localhost:8080
+./client 127.0.0.1 8080
+```
 
-## 🧠 Concepts Demonstrated
-
-- **Socket Programming**: Utilizes TCP sockets for reliable communication.
-- **Multithreading**: Employs threads to manage multiple client connections simultaneously.
-- **Client-Server Architecture**: Demonstrates the fundamentals of networked application design.
-
----
-
-## 🛠️ Potential Improvements
-
-- **User Authentication**: Implement user login and authentication mechanisms.
-- **Message Encryption**: Enhance security by encrypting messages.
-- **Graphical User Interface**: Develop a GUI for improved user experience.
-- **Broadcast Messaging**: Enable server to broadcast messages to all connected clients.
-
----
-
-
-## 🙋‍♂️ Author
-
-**Sahil Shaikh**  
-Computer Science Engineering Student  
-[GitHub Profile](https://github.com/s-aaahill)
+## Design Decisions
+- **Protocol**: Simple line-based text protocol. First message is username, subsequent messages are chat text.
+- **Threading**: One thread per client on the server to ensure blocking I/O doesn't freeze the server. Detached threads are used for simplicity.
+- **State Management**: A `std::map` protects client socket-to-username mappings with a `std::mutex` to prevent race conditions during broadcasting and disconnection.
+- **Logging**: Standard output logging is used to align with Docker best practices (logs collection drivers).
 
 ---
+*Author: Systems Programmer*

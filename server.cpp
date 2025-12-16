@@ -2,10 +2,15 @@
 #include <vector>
 #include <string>
 #include <thread>
-#include <mutex>      // <<< Added for std::mutex and std::lock_guard
+#include <mutex>
 #include <algorithm>
-#include <cstring>    // For memset, strerror
-#include <cerrno>     // For errno
+#include <cstring>
+#include <cerrno>
+#include <map>
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <cstdlib>
 
 // Platform specific includes and definitions
 #ifdef _WIN32
@@ -33,9 +38,9 @@
 #else // Linux, macOS, etc. (POSIX)
     #include <sys/socket.h>
     #include <netinet/in.h>
-    #include <arpa/inet.h>  // Include for inet_ntop
-    #include <unistd.h>     // For close()
-    #include <netdb.h>      // For gethostbyname (though not used directly here)
+    #include <arpa/inet.h>
+    #include <unistd.h>
+    #include <netdb.h>
     using socket_t = int;
     #define INVALID_SOCKET -1
     #define SOCKET_ERROR   -1
@@ -45,209 +50,217 @@
     inline void cleanup_sockets() {} // No-op on POSIX
 #endif
 
-const int PORT = 8080;
+int PORT = 8080; // Changed to non-const to allow modification from env
 const int BUFFER_SIZE = 4096;
 const int MAX_CLIENTS = 10;
 
-std::vector<socket_t> clients;
-std::mutex clients_mutex; // Global mutex to protect the clients vector
+// Map to store client sockets and their usernames
+std::map<socket_t, std::string> clients;
+std::mutex clients_mutex;
+
+// Helper function for timestamped logging
+void log_event(const std::string& message) {
+    auto now = std::chrono::system_clock::now();
+    std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+    std::tm now_tm;
+    #ifdef _WIN32
+        localtime_s(&now_tm, &now_c);
+    #else
+        localtime_r(&now_c, &now_tm);
+    #endif
+    
+    std::cout << "[" << std::put_time(&now_tm, "%Y-%m-%d %H:%M:%S") << "] " << message << std::endl;
+}
 
 // Function to broadcast a message to all clients except the sender
-void broadcast_message(const std::string& message, socket_t sender_socket) {
-    std::lock_guard<std::mutex> lock(clients_mutex); // Lock the mutex
-    for (socket_t client_socket : clients) {
-        if (client_socket != sender_socket && client_socket != INVALID_SOCKET) { // Check for valid socket
+void broadcast_message(const std::string& message, socket_t sender_socket = INVALID_SOCKET) {
+    std::lock_guard<std::mutex> lock(clients_mutex);
+    for (const auto& pair : clients) {
+        socket_t client_socket = pair.first;
+        if (client_socket != sender_socket && client_socket != INVALID_SOCKET) {
             if (send(client_socket, message.c_str(), message.length(), 0) == SOCKET_ERROR) {
-                // Log error but don't necessarily remove client here, recv error will handle removal
-                std::cerr << "Send failed to client " << client_socket << ". Error: " << socket_error() << " (" << strerror(socket_error()) << ")" << std::endl;
+                // Log error but don't spam stderr too much
             }
         }
     }
-    // Mutex is automatically unlocked when 'lock' goes out of scope
 }
 
 // Function to handle communication with a single client
 void handle_client(socket_t client_socket) {
     char buffer[BUFFER_SIZE];
     int bytes_received;
-    std::string client_id = "[Client " + std::to_string(client_socket) + "]"; // Simple ID based on socket descriptor
+    std::string username;
 
-    // Announce new client connection
-    std::cout << "Connection established for " << client_id << "." << std::endl;
-    broadcast_message(client_id + " has joined the chat.", client_socket); // Announce to others
+    // 1. Receive Username
+    bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0);
+    if (bytes_received > 0) {
+        buffer[bytes_received] = '\0';
+        username = std::string(buffer);
+        // Trim whitespace
+        size_t last_char = username.find_last_not_of(" \n\r\t");
+        if (last_char != std::string::npos) {
+            username = username.substr(0, last_char + 1);
+        } else {
+            username = "Anonymous";
+        }
+        if (username.empty()) username = "Anonymous";
+    } else {
+        close_socket(client_socket);
+        return;
+    }
 
-    // Loop to receive data from the client
+    // 2. Register Client
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        
+        // Handle duplicate names
+        std::string final_username = username;
+        int count = 1;
+        bool exists = true;
+        while (exists) {
+            exists = false;
+            for (const auto& pair : clients) {
+                if (pair.second == final_username) {
+                    exists = true;
+                    final_username = username + "_" + std::to_string(count++);
+                    break;
+                }
+            }
+        }
+        username = final_username;
+        clients[client_socket] = username;
+    }
+
+    log_event("User connected: " + username + " (Socket: " + std::to_string(client_socket) + ")");
+    std::string welcome_msg = "Welcome, " + username + "!\n";
+    send(client_socket, welcome_msg.c_str(), welcome_msg.length(), 0);
+    broadcast_message(username + " has joined the chat.", client_socket);
+
+    // 3. Message Loop
     while ((bytes_received = recv(client_socket, buffer, BUFFER_SIZE - 1, 0)) > 0) {
-        buffer[bytes_received] = '\0'; // Null-terminate the received string
+        buffer[bytes_received] = '\0';
         std::string message(buffer);
+        
+        // Trim
+       size_t last_char = message.find_last_not_of(" \n\r\t");
+        if (last_char != std::string::npos) {
+            message = message.substr(0, last_char + 1);
+        } else {
+            message = "";
+        }
 
-        // Trim potential newline characters sent by some telnet clients etc.
-        message.erase(message.find_last_not_of(" \n\r\t")+1);
+        if (message.empty()) continue;
 
-        if (message.empty()) continue; // Ignore empty messages
-
-        std::cout << "Received from " << client_id << ": " << message << std::endl;
-
-        // Prepare message for broadcast
-        std::string broadcast_msg = client_id + ": " + message;
+        log_event("Message from " + username + ": " + message);
+        
+        std::string broadcast_msg = "[" + username + "]: " + message;
         broadcast_message(broadcast_msg, client_socket);
     }
 
-    // Handle disconnection or error after the loop exits
-    if (bytes_received == 0) {
-        std::cout << client_id << " disconnected gracefully." << std::endl;
-        broadcast_message(client_id + " has left the chat.", client_socket);
-    } else { // bytes_received == SOCKET_ERROR
-        std::cerr << "Recv failed for " << client_id << ". Error: " << socket_error() << " (" << strerror(socket_error()) << ")" << std::endl;
-         broadcast_message(client_id + " connection lost.", client_socket);
-    }
+    // 4. Disconnect
+    log_event("User disconnected: " + username);
+    broadcast_message(username + " has left the chat.", client_socket);
 
-    // Clean up: Remove client from the list and close socket
+    // Clean up
     {
-        std::lock_guard<std::mutex> lock(clients_mutex); // Lock for safe removal
-        auto it = std::find(clients.begin(), clients.end(), client_socket);
-        if (it != clients.end()) {
-            clients.erase(it);
-        }
-    } // Mutex unlocked here
-
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        clients.erase(client_socket);
+    }
+    
     close_socket(client_socket);
-    std::cout << "Closed socket for " << client_id << "." << std::endl;
 }
 
 int main() {
-    init_sockets(); // Initialize Winsock on Windows
+    init_sockets();
+
+    // 1. Configuration from Env
+    const char* env_port = std::getenv("PORT");
+    if (env_port) {
+        try {
+            int p = std::stoi(env_port);
+            if (p > 0 && p <= 65535) PORT = p;
+            else std::cerr << "Invalid PORT environment variable. Using default 8080." << std::endl;
+        } catch (...) {
+            std::cerr << "Invalid PORT format. Using default 8080." << std::endl;
+        }
+    }
 
     socket_t server_fd = INVALID_SOCKET;
     struct sockaddr_in server_address;
 
-    // 1. Create socket file descriptor
+    // 2. Create Socket
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == INVALID_SOCKET) {
-        std::cerr << "Socket creation failed. Error: " << socket_error() << " (" << strerror(socket_error()) << ")" << std::endl;
+        std::cerr << "Socket creation failed." << std::endl;
         cleanup_sockets();
         return EXIT_FAILURE;
     }
-    std::cout << "Socket created successfully." << std::endl;
 
-
-    // --- Optional: Set socket options (allow address reuse) ---
-    // This helps prevent "Address already in use" errors if the server restarts quickly
     int opt = 1;
     #ifdef _WIN32
         if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt)) == SOCKET_ERROR) {
-            std::cerr << "setsockopt(SO_REUSEADDR) failed. Error: " << socket_error() << std::endl;
-            // Optional: Decide if this is fatal or just a warning
+             // warning
         }
-    #else // POSIX
+    #else
         if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-            perror("setsockopt(SO_REUSEADDR) failed");
-            // Optional: Decide if this is fatal or just a warning
+            // warning
         }
     #endif
-    //-----------------------------------------------------------
 
+    // 3. Bind
+    memset(&server_address, 0, sizeof(server_address));
+    server_address.sin_family = AF_INET;
+    server_address.sin_addr.s_addr = INADDR_ANY;
+    server_address.sin_port = htons(PORT);
 
-    // 2. Prepare the sockaddr_in structure
-    memset(&server_address, 0, sizeof(server_address)); // Zero out the structure
-    server_address.sin_family = AF_INET;                // IPv4 Address family
-    server_address.sin_addr.s_addr = INADDR_ANY;        // Listen on all available network interfaces
-    server_address.sin_port = htons(PORT);              // Convert port number to network byte order
-
-    // 3. Bind the socket to the network address and port
     if (bind(server_fd, (struct sockaddr*)&server_address, sizeof(server_address)) == SOCKET_ERROR) {
-        std::cerr << "Bind failed. Error: " << socket_error() << " (" << strerror(socket_error()) << ")" << std::endl;
+        std::cerr << "Bind failed." << std::endl;
         close_socket(server_fd);
         cleanup_sockets();
         return EXIT_FAILURE;
     }
-    std::cout << "Socket bound to port " << PORT << "." << std::endl;
 
-    // 4. Listen for incoming connections
+    // 4. Listen
     if (listen(server_fd, MAX_CLIENTS) == SOCKET_ERROR) {
-        std::cerr << "Listen failed. Error: " << socket_error() << " (" << strerror(socket_error()) << ")" << std::endl;
+        std::cerr << "Listen failed." << std::endl;
         close_socket(server_fd);
         cleanup_sockets();
         return EXIT_FAILURE;
     }
-    std::cout << "Server listening on port " << PORT << "..." << std::endl;
 
-    // 5. Accept incoming connections in a loop
+    log_event("Server started on port " + std::to_string(PORT));
+
+    // 5. Accept Loop
     while (true) {
         struct sockaddr_in client_address;
         socklen_t client_addr_len = sizeof(client_address);
-        socket_t client_socket = INVALID_SOCKET;
-
-        // Accept a client connection (blocking call)
-        client_socket = accept(server_fd, (struct sockaddr*)&client_address, &client_addr_len);
+        socket_t client_socket = accept(server_fd, (struct sockaddr*)&client_address, &client_addr_len);
 
         if (client_socket == INVALID_SOCKET) {
-            std::cerr << "Accept failed. Error: " << socket_error() << " (" << strerror(socket_error()) << ")" << std::endl;
-            // Consider more robust error handling here. E.g., EAGAIN/EWOULDBLOCK are non-fatal
-            if (socket_error() == EINTR) continue; // Interrupted system call, try again
-            // For other errors, maybe log and continue accepting? Or break if fatal?
-            continue; // Continue accepting other clients for now
+            continue; 
         }
-
-        // Get client IP address for logging
-        char client_ip[INET_ADDRSTRLEN]; // Buffer for IPv4 or IPv6 string
-        if (inet_ntop(AF_INET, &client_address.sin_addr, client_ip, INET_ADDRSTRLEN) != NULL) {
-             std::cout << "Connection accepted from " << client_ip << ":" << ntohs(client_address.sin_port) << " [Socket: " << client_socket << "]" << std::endl;
-        } else {
-             std::cerr << "inet_ntop failed for incoming connection. Error: " << socket_error() << " (" << strerror(socket_error()) << ")" << std::endl;
-             std::cout << "Connection accepted from unknown IP on socket " << client_socket << std::endl;
-        }
-
-
-        // Add new client to the list (thread-safe) and check capacity
+        
+        // Check capacity
+        bool accepted = false;
         {
             std::lock_guard<std::mutex> lock(clients_mutex);
-            if (clients.size() >= MAX_CLIENTS) {
-                std::cerr << "Max clients (" << MAX_CLIENTS << ") reached. Connection rejected for socket " << client_socket << "." << std::endl;
-                const char* msg = "Server is full. Please try again later.\n";
-                send(client_socket, msg, strlen(msg), 0);
-                close_socket(client_socket);
-                continue; // Go back to accept loop
+            if (clients.size() < MAX_CLIENTS) {
+                accepted = true;
+                // Temporarily add with placeholder until thread updates it
+                clients[client_socket] = "Connecting..."; 
             }
-             clients.push_back(client_socket);
-        } // Mutex unlocked here
+        }
 
-        try {
-             std::thread client_thread(handle_client, client_socket);
-             client_thread.detach(); // Allow thread to run independently
-        } catch (const std::system_error& e) {
-             std::cerr << "Failed to create thread for client " << client_socket << ": " << e.what() << std::endl;
-             // Clean up the client we couldn't create a thread for
-              {
-                  std::lock_guard<std::mutex> lock(clients_mutex);
-                  auto it = std::find(clients.begin(), clients.end(), client_socket);
-                  if (it != clients.end()) {
-                      clients.erase(it);
-                  }
-              }
+        if (accepted) {
+            std::thread(handle_client, client_socket).detach();
+        } else {
+             const char* msg = "Server full.\n";
+             send(client_socket, msg, strlen(msg), 0);
              close_socket(client_socket);
         }
     }
 
-    std::cout << "Shutting down server..." << std::endl;
-
-    // Close all remaining client sockets
-    {
-        std::lock_guard<std::mutex> lock(clients_mutex);
-        for (socket_t client_socket : clients) {
-             if (client_socket != INVALID_SOCKET) {
-                close_socket(client_socket);
-             }
-        }
-        clients.clear();
-    }
-
-    // Close the listening server socket
-    if (server_fd != INVALID_SOCKET) {
-        close_socket(server_fd);
-    }
-
-    cleanup_sockets(); // Cleanup Winsock on Windows
-
+    if (server_fd != INVALID_SOCKET) close_socket(server_fd);
+    cleanup_sockets();
     return 0;
 }
